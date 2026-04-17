@@ -563,6 +563,7 @@ impl pdb::Query {
                 &field,
                 parser,
                 schema,
+                searcher,
                 query_string,
                 lenient,
                 conjunction_mode,
@@ -1560,6 +1561,40 @@ fn resolve_search_tokenizer(
     Ok(searcher.index().tokenizer_for_field(search_field.field())?)
 }
 
+/// Temporarily registers `search_tokenizer` under the index tokenizer's name in the
+/// `TokenizerManager`, so that `QueryParser` (which resolves tokenizers by name) picks
+/// it up. Returns the info needed to restore the original registration afterward.
+fn override_search_tokenizer(
+    search_field: &SearchField,
+    schema: &SearchIndexSchema,
+    searcher: &Searcher,
+) -> Option<(String, tantivy::tokenizer::TextAnalyzer)> {
+    let config = search_field.field_config();
+    let search_tok = config
+        .search_tokenizer()
+        .or(schema.index_search_tokenizer().as_ref())?;
+    let index_tok = config.tokenizer()?;
+    let index_tok_name = index_tok.name();
+    let search_analyzer = search_tok.to_tantivy_tokenizer()?;
+    let original_analyzer = index_tok
+        .to_tantivy_tokenizer()
+        .expect("index tokenizer should be a valid tantivy tokenizer");
+    searcher
+        .index()
+        .tokenizers()
+        .register(&index_tok_name, search_analyzer);
+    Some((index_tok_name, original_analyzer))
+}
+
+fn restore_search_tokenizer(
+    searcher: &Searcher,
+    override_info: Option<(String, tantivy::tokenizer::TextAnalyzer)>,
+) {
+    if let Some((name, original_analyzer)) = override_info {
+        searcher.index().tokenizers().register(&name, original_analyzer);
+    }
+}
+
 fn tokenized_phrase(
     field: &FieldName,
     schema: &SearchIndexSchema,
@@ -1761,6 +1796,7 @@ fn parse_with_field<QueryParserCtor: Fn() -> QueryParser>(
     field: &FieldName,
     parser: &QueryParserCtor,
     schema: &SearchIndexSchema,
+    searcher: &Searcher,
     query_string: String,
     lenient: Option<bool>,
     conjunction_mode: Option<bool>,
@@ -1796,6 +1832,9 @@ fn parse_with_field<QueryParserCtor: Fn() -> QueryParser>(
         // If conversion fails, fall through to standard parsing (will likely error)
     }
 
+    // Temporarily override TokenizerManager so QueryParser uses search_tokenizer
+    let override_info = override_search_tokenizer(&search_field, schema, searcher);
+
     let mut parser = parser();
     let query_string = format!("{field}:({query_string})");
     if let Some(true) = conjunction_mode {
@@ -1813,16 +1852,18 @@ fn parse_with_field<QueryParserCtor: Fn() -> QueryParser>(
     }
 
     let lenient = lenient.unwrap_or(false);
-    Ok(if lenient {
+    let result = if lenient {
         let (parsed_query, _) = parser.parse_query_lenient(&query_string);
-        Box::new(parsed_query)
+        Ok(Box::new(parsed_query) as Box<dyn TantivyQuery>)
     } else {
-        Box::new(
-            parser
-                .parse_query(&query_string)
-                .map_err(|err| QueryError::ParseError(err, query_string))?,
-        )
-    })
+        parser
+            .parse_query(&query_string)
+            .map(|q| Box::new(q) as Box<dyn TantivyQuery>)
+            .map_err(|err| QueryError::ParseError(err, query_string).into())
+    };
+
+    restore_search_tokenizer(searcher, override_info);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

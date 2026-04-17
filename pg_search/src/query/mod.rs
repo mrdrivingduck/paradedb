@@ -1198,24 +1198,30 @@ impl SearchQueryInput {
                 lenient,
                 conjunction_mode,
             } => {
+                // Override TokenizerManager for all fields with search_tokenizer
+                let overrides = override_all_search_tokenizers(schema, searcher);
+
                 let mut query_parser = parser();
                 if let Some(true) = conjunction_mode {
                     query_parser.set_conjunction_by_default();
                 }
 
-                let query = match lenient {
+                let query: Result<Box<dyn TantivyQuery>> = match lenient {
                     Some(true) => {
                         let (parsed_query, _) = query_parser.parse_query_lenient(&query_string);
-                        Box::new(parsed_query) as Box<dyn TantivyQuery>
+                        Ok(Box::new(parsed_query) as Box<dyn TantivyQuery>)
                     }
-                    _ => Box::new(
-                        query_parser
-                            .parse_query(&query_string)
-                            .map_err(|err| QueryError::ParseError(err, query_string.clone()))?,
-                    ) as Box<dyn TantivyQuery>,
+                    _ => query_parser
+                        .parse_query(&query_string)
+                        .map(|q| Box::new(q) as Box<dyn TantivyQuery>)
+                        .map_err(|err| {
+                            QueryError::ParseError(err, query_string.clone()).into()
+                        }),
                 };
 
-                Ok(builder.build_leaf(query, || "Parse Query".to_string(), cloned_for_estimate))
+                restore_all_search_tokenizers(searcher, overrides);
+
+                Ok(builder.build_leaf(query?, || "Parse Query".to_string(), cloned_for_estimate))
             }
             SearchQueryInput::TermSet { terms: fields } => {
                 let query = Box::new(TermSetQuery::new(fields.into_iter().map(
@@ -1480,6 +1486,52 @@ impl TryFrom<&str> for TantivyDateTime {
         Ok(TantivyDateTime(DateTime::from_timestamp_micros(
             datetime.and_utc().timestamp_micros(),
         )))
+    }
+}
+
+/// Temporarily overrides `TokenizerManager` entries for all text/json fields that have
+/// a `search_tokenizer`, so that `QueryParser` uses the search-time tokenizer.
+/// Returns a list of `(name, original_analyzer)` pairs for restoration.
+fn override_all_search_tokenizers(
+    schema: &SearchIndexSchema,
+    searcher: &Searcher,
+) -> Vec<(String, tantivy::tokenizer::TextAnalyzer)> {
+    let index_search_tokenizer = schema.index_search_tokenizer();
+    let mut overrides = Vec::new();
+    for (search_field, _) in schema.categorized_fields().iter() {
+        if search_field.is_ctid() {
+            continue;
+        }
+        let config = search_field.field_config();
+        let search_tok = config
+            .search_tokenizer()
+            .or(index_search_tokenizer.as_ref());
+        if let (Some(search_tok), Some(index_tok)) = (search_tok, config.tokenizer()) {
+            let index_tok_name = index_tok.name();
+            if let Some(search_analyzer) = search_tok.to_tantivy_tokenizer() {
+                let original_analyzer = index_tok
+                    .to_tantivy_tokenizer()
+                    .expect("index tokenizer should be a valid tantivy tokenizer");
+                searcher
+                    .index()
+                    .tokenizers()
+                    .register(&index_tok_name, search_analyzer);
+                overrides.push((index_tok_name, original_analyzer));
+            }
+        }
+    }
+    overrides
+}
+
+fn restore_all_search_tokenizers(
+    searcher: &Searcher,
+    overrides: Vec<(String, tantivy::tokenizer::TextAnalyzer)>,
+) {
+    for (name, original_analyzer) in overrides {
+        searcher
+            .index()
+            .tokenizers()
+            .register(&name, original_analyzer);
     }
 }
 

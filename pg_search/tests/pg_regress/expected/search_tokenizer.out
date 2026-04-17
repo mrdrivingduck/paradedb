@@ -240,6 +240,43 @@ SELECT id, content FROM combined_test WHERE content ||| 'hello' ORDER BY id;
   3 | HELLO AGAIN
 (3 rows)
 
+-- ============================================================
+-- Test @@@ operator with search_tokenizer
+-- ============================================================
+-- @@@ should honor search_tokenizer just like ||| does.
+-- Reuse the autocomplete table (ngram index + unicode_words search tokenizer).
+-- "sho" stays as one token at search time → matches titles whose prefix ngrams include "sho"
+SELECT id, title FROM autocomplete WHERE title @@@ 'sho' ORDER BY id;
+ id |   title
+----+-----------
+  1 | shoes
+  3 | shorts
+  4 | shoelaces
+(3 rows)
+
+-- "s" stays as one token → matches every title starting with s
+SELECT id, title FROM autocomplete WHERE title @@@ 's' ORDER BY id;
+ id |   title
+----+-----------
+  1 | shoes
+  2 | shirt
+  3 | shorts
+  4 | shoelaces
+  5 | socks
+(5 rows)
+
+-- Without search_tokenizer, @@@ uses index tokenizer (ngram), "sho" gets split
+-- into s, sh, sho → matches all 5 titles
+SELECT id, title FROM autocomplete_plain WHERE title @@@ 'sho' ORDER BY id;
+ id |   title
+----+-----------
+  1 | shoes
+  2 | shirt
+  3 | shorts
+  4 | shoelaces
+  5 | socks
+(5 rows)
+
 -- Cleanup
 DROP TABLE autocomplete;
 DROP TABLE autocomplete_plain;

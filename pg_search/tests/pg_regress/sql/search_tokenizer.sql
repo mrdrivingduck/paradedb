@@ -114,6 +114,23 @@ SELECT id, content FROM combined_test WHERE content ||| 'Hello' ORDER BY id;
 -- "hello" already lowercase → matches prefixes in the ngram index
 SELECT id, content FROM combined_test WHERE content ||| 'hello' ORDER BY id;
 
+-- ============================================================
+-- Test @@@ operator with search_tokenizer
+-- ============================================================
+
+-- @@@ should honor search_tokenizer just like ||| does.
+-- Reuse the autocomplete table (ngram index + unicode_words search tokenizer).
+
+-- "sho" stays as one token at search time → matches titles whose prefix ngrams include "sho"
+SELECT id, title FROM autocomplete WHERE title @@@ 'sho' ORDER BY id;
+
+-- "s" stays as one token → matches every title starting with s
+SELECT id, title FROM autocomplete WHERE title @@@ 's' ORDER BY id;
+
+-- Without search_tokenizer, @@@ uses index tokenizer (ngram), "sho" gets split
+-- into s, sh, sho → matches all 5 titles
+SELECT id, title FROM autocomplete_plain WHERE title @@@ 'sho' ORDER BY id;
+
 -- Cleanup
 DROP TABLE autocomplete;
 DROP TABLE autocomplete_plain;
